@@ -10,13 +10,15 @@ import keiyoushi.annotation.Source
 import keiyoushi.network.Fetch
 import keiyoushi.network.fetch
 import keiyoushi.network.get
+import keiyoushi.network.post
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
-import keiyoushi.utils.WebViewTimeoutException
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.extractNextJs
+import keiyoushi.utils.getTurnstileToken
 import keiyoushi.utils.parseAs
-import keiyoushi.utils.runWebView
 import keiyoushi.utils.toJsonElement
+import keiyoushi.utils.toJsonRequestBody
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import okhttp3.Headers
@@ -24,9 +26,10 @@ import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.io.IOException
-import kotlin.time.Duration.Companion.milliseconds
-import kotlin.time.Duration.Companion.seconds
+import org.jsoup.nodes.Document
+
+private const val TURNSTILE_SITE_KEY = "0x4AAAAAAEOmIHqZQLQ6GPRc"
+private val UNLOCK_ACTION_REGEX = Regex("""createServerReference\)?\("([0-9a-f]+)"[^)]*"unlockChapterPages"""")
 
 @Source
 abstract class VoraToon : KeiSource() {
@@ -37,6 +40,11 @@ abstract class VoraToon : KeiSource() {
 
     private val rscHeaders: Headers
         get() = headers.newBuilder().set("RSC", "1").build()
+
+    private fun unlockHeaders(actionId: String): Headers = headers.newBuilder()
+        .set("Accept", "text/x-component")
+        .set("Next-Action", actionId)
+        .build()
 
     override suspend fun getPopularManga(page: Int): MangasPage = parseSeriesList(
         "$baseUrl/browse".toHttpUrl().newBuilder()
@@ -112,53 +120,52 @@ abstract class VoraToon : KeiSource() {
         val (slug, chapterIndex) = chapter.getSlugAndIndex(baseUrl)
         val chapterUrl = "$baseUrl/series/$slug/chapter/$chapterIndex"
 
-        val directDto = runCatching {
-            client.get(chapterUrl, rscHeaders, Fetch.XHR).extractNextJs<ChapterPageDto> {
-                it is JsonObject && "chapter" in it
-            }
-        }.getOrNull()
+        val document = client.get(chapterUrl, Fetch.DOCUMENT).asJsoup()
+        val dto = document.extractNextJs<ChapterPageDto> {
+            it is JsonObject && "chapter" in it
+        } ?: error("Failed to extract chapter pages")
 
-        val directPages = directDto?.chapter?.toPageList(chapterUrl)
-        if (!directPages.isNullOrEmpty()) {
-            return directPages
-        }
-
-        val images = try {
-            runWebView<List<String>>(timeout = 25.seconds) {
-                userAgent = headers["User-Agent"] ?: ""
-                poll(500.milliseconds) {
-                    evaluateJs(
-                        """
-                        (() => {
-                            const imgs = Array.from(document.querySelectorAll('img[data-chapter-page], [data-reader-chapter-id] img'))
-                                .map(img => img.getAttribute('data-chapter-page') || img.src)
-                                .filter(src => src && (src.startsWith('http://') || src.startsWith('https://')));
-                            return imgs.length > 0 ? Array.from(new Set(imgs)) : null;
-                        })()
-                        """.trimIndent(),
-                    ) { output ->
-                        val list = runCatching {
-                            output.trim().takeIf { it != "null" && it != "undefined" }?.let { raw ->
-                                runCatching { raw.parseAs<List<String>>() }.getOrElse {
-                                    raw.parseAs<String>().parseAs<List<String>>()
-                                }
-                            }
-                        }.getOrNull()
-
-                        if (!list.isNullOrEmpty()) {
-                            resolve(list)
-                        }
-                    }
-                }
-                loadUrl(chapterUrl)
-            }
-        } catch (_: WebViewTimeoutException) {
-            throw IOException("Selesaikan verifikasi di WebView lalu coba lagi")
-        }
+        val ticket = dto.chapter.pagesTicket ?: error("Failed to extract chapter ticket")
+        val images = unlockPages(chapterUrl, findUnlockActionId(document), ticket)
 
         return images.mapIndexed { index, imageUrl ->
             Page(index, url = chapterUrl, imageUrl = imageUrl)
         }
+    }
+
+    private suspend fun findUnlockActionId(document: Document): String {
+        val scriptUrl = document.selectFirst("script[src*='/chapter/'][src*='/page-']")?.attr("abs:src")
+            ?: error("Failed to find chapter reader script")
+        val script = client.get(scriptUrl, Fetch.SCRIPT).use { it.body.string() }
+        return UNLOCK_ACTION_REGEX.find(script)?.groupValues?.get(1)
+            ?: error("Failed to find chapter unlock action")
+    }
+
+    // Chapter images are behind the reader's "unlockChapterPages" server action, guarded by
+    // Turnstile on the first request of a chapter.
+    private suspend fun unlockPages(chapterUrl: String, actionId: String, ticket: String): List<String> {
+        val initial = requestUnlock(chapterUrl, actionId, ticket)
+        if (initial.ok) {
+            return initial.images
+        }
+        check(initial.reason == "challenge") { initial.message ?: "Failed to unlock chapter pages" }
+
+        val token = getTurnstileToken(chapterUrl, TURNSTILE_SITE_KEY, action = "reader")
+        val verified = requestUnlock(chapterUrl, actionId, ticket, token)
+        check(verified.ok) { verified.message ?: "Chapter verification failed" }
+        return verified.images
+    }
+
+    private suspend fun requestUnlock(
+        chapterUrl: String,
+        actionId: String,
+        ticket: String,
+        token: String? = null,
+    ): UnlockPagesDto {
+        val body = if (token == null) listOf(ticket) else listOf(ticket, token)
+        return client.post(chapterUrl, unlockHeaders(actionId), Fetch.XHR, body.toJsonRequestBody())
+            .extractNextJs<UnlockPagesDto> { it is JsonObject && "ok" in it }
+            ?: error("Failed to unlock chapter pages")
     }
 
     override fun getImageRequest(page: Page): Request = super.getImageRequest(page).newBuilder()

@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.extension.id.voratoon
 
-import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.utils.tryParse
@@ -94,6 +93,7 @@ class ChapterItem(
     private val createdAt: String? = null,
     private val updatedAt: String? = null,
     private val chapterIndex: Float? = null,
+    val pagesTicket: String? = null,
 ) {
     fun toSChapter(seriesSlug: String?): SChapter = SChapter.create().apply {
         val index = (data.index ?: chapterIndex) ?: 0f
@@ -107,17 +107,20 @@ class ChapterItem(
         date_upload = parseChapterDate(createdAt ?: updatedAt ?: "")
         chapter_number = index
     }
-
-    fun toPageList(chapterUrl: String = ""): List<Page> = data.images?.mapIndexed { index, imageUrl ->
-        Page(index, url = chapterUrl, imageUrl = imageUrl)
-    } ?: emptyList()
 }
 
 @Serializable
 class ChapterData(
     val index: Float? = null,
     val title: String? = null,
-    val images: List<String>? = null,
+)
+
+@Serializable
+class UnlockPagesDto(
+    val ok: Boolean,
+    val images: List<String> = emptyList(),
+    val reason: String? = null,
+    val message: String? = null,
 )
 
 private fun parseChapterDate(dateString: String): Long = Instant.tryParse(dateString)
