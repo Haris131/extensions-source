@@ -120,13 +120,18 @@ abstract class VoraToon : KeiSource() {
         val (slug, chapterIndex) = chapter.getSlugAndIndex(baseUrl)
         val chapterUrl = "$baseUrl/series/$slug/chapter/$chapterIndex"
 
-        val document = client.get(chapterUrl, Fetch.DOCUMENT).asJsoup()
-        val dto = document.extractNextJs<ChapterPageDto> {
+        val dto = client.get(chapterUrl, rscHeaders, Fetch.XHR).extractNextJs<ChapterPageDto> {
             it is JsonObject && "chapter" in it
         } ?: error("Failed to extract chapter pages")
 
-        val ticket = dto.chapter.pagesTicket ?: error("Failed to extract chapter ticket")
-        val images = unlockPages(chapterUrl, findUnlockActionId(document), ticket)
+        val inlineImages = dto.chapter.pageImages()
+        val images = if (inlineImages.isNotEmpty()) {
+            inlineImages
+        } else {
+            val ticket = dto.chapter.pagesTicket ?: return emptyList()
+            val document = client.get(chapterUrl, Fetch.DOCUMENT).asJsoup()
+            unlockPages(chapterUrl, findUnlockActionId(document), ticket)
+        }
 
         return images.mapIndexed { index, imageUrl ->
             Page(index, url = chapterUrl, imageUrl = imageUrl)

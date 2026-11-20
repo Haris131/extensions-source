@@ -107,12 +107,15 @@ class ChapterItem(
         date_upload = parseChapterDate(createdAt ?: updatedAt ?: "")
         chapter_number = index
     }
+
+    fun pageImages(): List<String> = data.images.orEmpty()
 }
 
 @Serializable
 class ChapterData(
     val index: Float? = null,
     val title: String? = null,
+    val images: List<String>? = null,
 )
 
 @Serializable
